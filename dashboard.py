@@ -3,6 +3,10 @@ Macro Rates Dashboard - Streamlit web app.
 Uses the same data logic as fetch_macro_data.py. Run: streamlit run dashboard.py
 """
 
+import os
+from datetime import date
+from typing import Optional
+
 import streamlit as st
 
 from fetch_macro_data import (
@@ -31,6 +35,48 @@ def _val_1m(r):
     if not r or len(r) < 5:
         return None
     return r[4]
+
+
+# 2026 meeting dates: (month, day_start, day_end) for Fed; (month, day) for BCCh
+FED_2026 = [(1, 27, 28), (3, 17, 18), (4, 28, 29), (6, 16, 17), (7, 28, 29), (9, 15, 16), (10, 27, 28), (12, 8, 9)]
+BCCH_2026 = [(1, 26), (3, 24), (4, 27), (6, 16), (7, 27), (9, 8), (10, 26), (12, 15)]
+MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _meeting_last_next(meeting_dates_list, single_day=False):
+    """Return (last_meeting_str, next_meeting_str) for 2026. meeting_dates_list: list of (m, d) or (m, d1, d2)."""
+    today = date.today()
+    if today.year != 2026:
+        return None, None
+    last_str, next_str = None, None
+    for t in meeting_dates_list:
+        if single_day:
+            m, d = t[0], t[1]
+            d_ = date(2026, m, d)
+            label = f"{MONTHS[m]} {d}"
+        else:
+            m, d1, d2 = t[0], t[1], t[2]
+            d_ = date(2026, m, d1)
+            label = f"{MONTHS[m]} {d1}–{d2}"
+        if d_ <= today:
+            last_str = label
+        elif d_ > today and next_str is None:
+            next_str = label
+    return last_str, next_str
+
+
+def get_fed_meeting_line():
+    last, next_ = _meeting_last_next(FED_2026, single_day=False)
+    if last is None and next_ is None:
+        return None
+    return f"Last meeting: {last or '—'} — Next meeting: {next_ or '—'}"
+
+
+def get_bcch_meeting_line():
+    last, next_ = _meeting_last_next(BCCH_2026, single_day=True)
+    if last is None and next_ is None:
+        return None
+    return f"Last meeting: {last or '—'} — Next meeting: {next_ or '—'}"
 
 
 def compute_anomalies(fred_results, bcch_results, spreads):
@@ -130,12 +176,15 @@ def metric_card_with_trend(
     cur, cur_date,
     val_1w, date_1w,
     val_1m, date_1m,
+    meeting_line: Optional[str] = None,
 ):
-    """Render a rate metric: value, bps vs 1m (gray, ⚠ if |change|>10bps), direction arrow (red/green), date."""
+    """Render a rate metric: value, bps vs 1m (gray, ⚠ if |change|>10bps), direction arrow (red/green), date, optional meeting line."""
     with st.container():
         st.markdown(f"**{label}**")
         if cur is None:
             st.markdown("<span style='font-size: 1.75rem; font-weight: 600;'>—</span>", unsafe_allow_html=True)
+            if meeting_line:
+                st.markdown(f"<span style='font-size: 0.75rem; color: #888;'>{meeting_line}</span>", unsafe_allow_html=True)
             st.caption(f"As of {cur_date or 'N/A'}")
             return
         st.markdown(f"<span style='font-size: 1.75rem; font-weight: 600;'>{cur:.2f}%</span>", unsafe_allow_html=True)
@@ -153,6 +202,8 @@ def metric_card_with_trend(
             arrow = "↑" if cur > val_1m else "↓"
             color = "red" if cur > val_1m else "green"
             st.markdown(f"<span style='font-size: 1.1rem; font-weight: 600; color: {color};'>vs 1m {arrow}</span>", unsafe_allow_html=True)
+        if meeting_line:
+            st.markdown(f"<span style='font-size: 0.75rem; color: #888;'>{meeting_line}</span>", unsafe_allow_html=True)
         st.caption(f"As of {cur_date or 'N/A'}")
 
 
@@ -266,7 +317,8 @@ def main():
             date_1w = row[3] if len(row) > 3 else None
             val_1m = row[4] if len(row) > 4 else None
             date_1m = row[5] if len(row) > 5 else None
-            metric_card_with_trend(label, cur, cur_date, val_1w, date_1w, val_1m, date_1m)
+            meeting = get_fed_meeting_line() if label == "US Federal Funds Rate" else None
+            metric_card_with_trend(label, cur, cur_date, val_1w, date_1w, val_1m, date_1m, meeting_line=meeting)
 
     st.divider()
 
@@ -280,7 +332,8 @@ def main():
             date_1w = row[3] if len(row) > 3 else None
             val_1m = row[4] if len(row) > 4 else None
             date_1m = row[5] if len(row) > 5 else None
-            metric_card_with_trend(label, cur, cur_date, val_1w, date_1w, val_1m, date_1m)
+            meeting = get_bcch_meeting_line() if label == "Chile Central Bank Policy Rate (TPM)" else None
+            metric_card_with_trend(label, cur, cur_date, val_1w, date_1w, val_1m, date_1m, meeting_line=meeting)
 
     st.divider()
 
@@ -290,6 +343,31 @@ def main():
     for i, (label, value, date_str) in enumerate(spreads):
         with spread_cols[i]:
             metric_card(label, value, date_str or "N/A", is_spread=True)
+
+    st.divider()
+
+    # --- Daily View ---
+    st.subheader("Daily View")
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    daily_notes_path = os.path.join(_dir, "daily_notes.txt")
+    note = st.text_input("Note", key="daily_note", placeholder="Add a note...", label_visibility="collapsed")
+    if st.button("Save"):
+        if note and note.strip():
+            today = date.today().isoformat()
+            with open(daily_notes_path, "a", encoding="utf-8") as f:
+                f.write(f"{today} | {note.strip()}\n")
+            st.rerun()
+    if os.path.exists(daily_notes_path):
+        with open(daily_notes_path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        last_5 = lines[-5:] if len(lines) >= 5 else lines
+        last_5.reverse()
+        for ln in last_5:
+            if " | " in ln:
+                d, text = ln.split(" | ", 1)
+                st.markdown(f"<span style='font-size: 0.8rem; color: #888;'>{d}</span> {text}", unsafe_allow_html=True)
+            else:
+                st.caption(ln)
 
 
 if __name__ == "__main__":
