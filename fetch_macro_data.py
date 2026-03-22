@@ -55,6 +55,21 @@ def get_bcch_credentials():
     return None, None
 
 
+def get_notion_credentials():
+    """
+    Notion integration token and database ID from environment or .env.
+    Returns (token, db_id) or (None, None).
+
+    Tokens may start with ``secret_`` (older) or ``ntn_`` (newer); the value is used
+    exactly as provided—only leading/trailing whitespace is removed, never the prefix.
+    """
+    _load_env()
+    raw_token = os.environ.get("NOTION_TOKEN") or ""
+    token = raw_token.strip() or None  # do not strip or rewrite token body (e.g. ntn_…)
+    db_id = (os.environ.get("NOTION_DATABASE_ID") or "").strip() or None
+    return token, db_id
+
+
 # ---------------------------------------------------------------------------
 # 1. FETCH US DATA FROM FRED (Federal Reserve)
 # ---------------------------------------------------------------------------
@@ -82,9 +97,24 @@ def _fred_value_at_or_before(series, target_date):
         return None, None
 
 
+def _fred_history(series, days=365):
+    """Return list of (date_str, value) for the last `days` days (for spread sparklines)."""
+    try:
+        import pandas as pd
+
+        if series is None or series.empty:
+            return []
+        cutoff = series.index[-1] - pd.Timedelta(days=days)
+        sliced = series.loc[series.index >= cutoff].dropna()
+        return [(str(idx)[:10], float(val)) for idx, val in sliced.items()]
+    except Exception:
+        return []
+
+
 def fetch_fred_series(api_key):
     """
-    Fetch FRED series with trend. Returns dict label -> (cur_val, cur_date, val_1w, date_1w, val_1m, date_1m).
+    Fetch FRED series with trend and 12m history.
+    Returns dict label -> (cur_val, cur_date, val_1w, date_1w, val_1m, date_1m, history).
     """
     try:
         from fredapi import Fred
@@ -100,11 +130,11 @@ def fetch_fred_series(api_key):
         try:
             series = fred.get_series(series_id)
             if series is None or series.empty:
-                result[label] = (None, None, None, None, None, None)
+                result[label] = (None, None, None, None, None, None, [])
                 continue
             series = series.dropna()
             if series.empty:
-                result[label] = (None, None, None, None, None, None)
+                result[label] = (None, None, None, None, None, None, [])
                 continue
             last_date = series.index[-1]
             last_value = float(series.iloc[-1])
@@ -114,9 +144,10 @@ def fetch_fred_series(api_key):
             target_1m = last_date - pd.Timedelta(days=30)
             val_1w, date_1w = _fred_value_at_or_before(series, target_1w)
             val_1m, date_1m = _fred_value_at_or_before(series, target_1m)
-            result[label] = (last_value, date_str, val_1w, date_1w, val_1m, date_1m)
+            history = _fred_history(series, days=365)
+            result[label] = (last_value, date_str, val_1w, date_1w, val_1m, date_1m, history)
         except Exception as e:
-            result[label] = (None, str(e), None, None, None, None)
+            result[label] = (None, str(e), None, None, None, None, [])
 
     return result
 
@@ -198,7 +229,8 @@ def _bcch_value_at_or_before(obs, target_ymd):
 
 def fetch_bcch_series(user, password):
     """
-    Fetch BCCh series with trend. Returns dict label -> (cur_val, cur_date, val_1w, date_1w, val_1m, date_1m).
+    Fetch BCCh series with trend and 12m history.
+    Returns dict label -> (cur_val, cur_date, val_1w, date_1w, val_1m, date_1m, history).
     """
     import urllib.request
     import urllib.parse
@@ -207,7 +239,7 @@ def fetch_bcch_series(user, password):
 
     results = {}
     end = date.today()
-    start = end - timedelta(days=90)
+    start = end - timedelta(days=365)
     firstdate = start.isoformat()
     lastdate = end.isoformat()
 
@@ -228,7 +260,7 @@ def fetch_bcch_series(user, password):
             data = json.loads(raw)
             if isinstance(data, dict) and data.get("Codigo") and data.get("Codigo") != 0:
                 msg = data.get("Descripcion", "Unknown error")
-                results[label] = (None, msg, None, None, None, None)
+                results[label] = (None, msg, None, None, None, None, [])
                 continue
             obs = _parse_bcch_response(data)
             if not obs and isinstance(data, dict):
@@ -237,7 +269,7 @@ def fetch_bcch_series(user, password):
                     if obs:
                         break
             if not obs:
-                results[label] = (None, "No observations in response", None, None, None, None)
+                results[label] = (None, "No observations in response", None, None, None, None, [])
                 continue
             obs.sort(key=lambda x: x[0])
             last_date_str, last_val = obs[-1]
@@ -246,15 +278,17 @@ def fetch_bcch_series(user, password):
             target_1m = (datetime.strptime(last_date_str, "%Y-%m-%d").date() - timedelta(days=30)).strftime("%Y-%m-%d")
             val_1w, date_1w = _bcch_value_at_or_before(obs, target_1w)
             val_1m, date_1m = _bcch_value_at_or_before(obs, target_1m)
-            results[label] = (cur, last_date_str, val_1w, date_1w, val_1m, date_1m)
+            cutoff_ymd = (datetime.strptime(last_date_str, "%Y-%m-%d").date() - timedelta(days=365)).strftime("%Y-%m-%d")
+            history = [(d, float(v)) for d, v in obs if d >= cutoff_ymd]
+            results[label] = (cur, last_date_str, val_1w, date_1w, val_1m, date_1m, history)
         except urllib.error.HTTPError as e:
-            results[label] = (None, f"HTTP {e.code}", None, None, None, None)
+            results[label] = (None, f"HTTP {e.code}", None, None, None, None, [])
         except urllib.error.URLError as e:
-            results[label] = (None, str(e.reason) if getattr(e, "reason", None) else str(e), None, None, None, None)
+            results[label] = (None, str(e.reason) if getattr(e, "reason", None) else str(e), None, None, None, None, [])
         except json.JSONDecodeError as e:
-            results[label] = (None, f"Invalid JSON: {e}", None, None, None, None)
+            results[label] = (None, f"Invalid JSON: {e}", None, None, None, None, [])
         except Exception as e:
-            results[label] = (None, str(e), None, None, None, None)
+            results[label] = (None, str(e), None, None, None, None, [])
 
     return results
 
@@ -273,7 +307,7 @@ def _spread_date_recent(d1, d2):
 
 
 def _cur(r):
-    """Current value and date from a rate result (2- or 6-tuple)."""
+    """Current value and date from a rate result (first two fields of 6- or 7-tuple)."""
     if not r or len(r) < 2:
         return None, None
     return r[0], r[1]

@@ -1,7 +1,9 @@
 # Free APIs - no payment required
 # FRED: free API key at https://fred.stlouisfed.org/docs/api/api_key.html
 fredapi>=0.5.2
+pandas>=2.0.0
 # BCCh: free credentials at https://si3.bcentral.cl/estadisticas/Principal1/Web_Services/index.htm
 # (stdlib urllib used for BCCh; no extra package needed)
 streamlit>=1.28.0
 plotly>=5.18.0
+requests>=2.28.0

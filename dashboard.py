@@ -5,13 +5,17 @@ Uses the same data logic as fetch_macro_data.py. Run: streamlit run dashboard.py
 
 import os
 from datetime import date
-from typing import Optional
+from typing import List, Optional, Tuple
 
+import pandas as pd
 import streamlit as st
+
+import requests
 
 from fetch_macro_data import (
     get_fred_api_key,
     get_bcch_credentials,
+    get_notion_credentials,
     fetch_fred_series,
     fetch_bcch_series,
     compute_all_spreads,
@@ -35,6 +39,236 @@ def _val_1m(r):
     if not r or len(r) < 5:
         return None
     return r[4]
+
+
+def _history(r) -> List[Tuple[str, float]]:
+    """Last element of fetch tuple: list of (date_str, value) for ~12m sparklines."""
+    if not r or len(r) < 7:
+        return []
+    h = r[6]
+    return h if isinstance(h, list) else []
+
+
+def _history_df(points: List[Tuple[str, float]]) -> Optional[pd.DataFrame]:
+    if not points:
+        return None
+    df = pd.DataFrame(points, columns=["date", "value"])
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+
+
+def _spread_history(left_df: pd.DataFrame, right_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Align two series by date (as-of backward) and return date + spread = left - right."""
+    if left_df is None or right_df is None or left_df.empty or right_df.empty:
+        return None
+    L = left_df.rename(columns={"value": "left"}).sort_values("date")
+    R = right_df.rename(columns={"value": "right"}).sort_values("date")
+    merged = pd.merge_asof(L, R, on="date", direction="backward")
+    merged = merged.dropna(subset=["left", "right"])
+    if merged.empty:
+        return None
+    merged["spread"] = merged["left"] - merged["right"]
+    return merged[["date", "spread"]]
+
+
+def render_spread_sparkline(
+    left_hist: List[Tuple[str, float]],
+    right_hist: List[Tuple[str, float]],
+    current_spread: Optional[float] = None,
+    chart_key: str = "spark",
+):
+    """Compact ~12m spread history: line color matches spread sign; dotted 12m average + label."""
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        st.caption("12m history: install plotly")
+        return
+
+    left_df = _history_df(left_hist)
+    right_df = _history_df(right_hist)
+    mdf = _spread_history(left_df, right_df) if left_df is not None and right_df is not None else None
+    if mdf is None or mdf.empty:
+        st.caption("12m history: —")
+        return
+
+    spreads_arr = mdf["spread"].values
+    avg_v = float(spreads_arr.mean())
+
+    if current_spread is not None:
+        if current_spread > 0:
+            line_color = "#2e7d32"
+        elif current_spread < 0:
+            line_color = "#c62828"
+        else:
+            line_color = "#555555"
+    else:
+        line_color = "#444444"
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=mdf["date"],
+            y=mdf["spread"],
+            mode="lines",
+            line=dict(color=line_color, width=2),
+            hovertemplate="%{y:+.2f}%<extra></extra>",
+            name="",
+        )
+    )
+    fig.add_hline(y=avg_v, line_dash="dot", line_color="rgba(0,0,0,0.45)", line_width=1)
+    fig.add_annotation(
+        xref="paper",
+        x=1.0,
+        y=avg_v,
+        yref="y",
+        xanchor="left",
+        yanchor="middle",
+        text=f" 12m avg {avg_v:+.2f}%",
+        showarrow=False,
+        font=dict(size=10, color="#444444"),
+    )
+    fig.update_layout(
+        height=145,
+        margin=dict(l=0, r=8, t=4, b=28),
+        showlegend=False,
+        xaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            tickfont=dict(size=9, color="#888888"),
+            tickformat="%b",
+            nticks=5,
+            showline=False,
+        ),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, showline=False),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=chart_key)
+
+
+# ---------------------------------------------------------------------------
+# Notion Daily View (requests → Notion API, no SDK)
+# ---------------------------------------------------------------------------
+
+NOTION_API_BASE = "https://api.notion.com/v1"
+NOTION_API_VERSION = "2022-06-28"
+NOTION_PROP_DATE = "Date"
+NOTION_PROP_NOTE = "Note"
+_NOTION_TEXT_CHUNK = 2000  # Notion rich_text / title segment limit
+
+
+def _normalize_notion_database_id(raw: str) -> str:
+    """Accept UUID with or without hyphens (as copied from Notion URLs)."""
+    s = raw.replace("-", "").replace(" ", "").strip()
+    if len(s) == 32:
+        return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
+    return raw.strip()
+
+
+def _notion_headers(token: str) -> dict:
+    # Bearer token is passed verbatim (Notion uses secret_* or ntn_* prefixes; do not alter).
+    return {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _notion_note_property_value(note_text: str) -> dict:
+    """
+    Build API payload for the Note column.
+    Default: rich_text (Notion "Text"). If your DB uses the primary Title column named "Note",
+    set NOTION_NOTE_AS_TITLE=true in .env.
+    """
+    use_title = os.environ.get("NOTION_NOTE_AS_TITLE", "").strip().lower() in ("1", "true", "yes")
+    chunks = [note_text[i : i + _NOTION_TEXT_CHUNK] for i in range(0, len(note_text), _NOTION_TEXT_CHUNK)]
+    if not chunks:
+        chunks = [""]
+    if use_title:
+        return {"title": [{"type": "text", "text": {"content": chunks[0]}}]}
+    return {"rich_text": [{"type": "text", "text": {"content": c}} for c in chunks]}
+
+
+def notion_create_daily_page(token: str, database_id: str, note_text: str, d: date) -> Tuple[bool, str]:
+    """Create a row in the Notion database with Date + Note. Returns (success, error_message)."""
+    db_id = _normalize_notion_database_id(database_id)
+    payload = {
+        "parent": {"database_id": db_id},
+        "properties": {
+            NOTION_PROP_DATE: {"date": {"start": d.isoformat()}},
+            NOTION_PROP_NOTE: _notion_note_property_value(note_text),
+        },
+    }
+    try:
+        resp = requests.post(
+            f"{NOTION_API_BASE}/pages",
+            headers=_notion_headers(token),
+            json=payload,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        return False, str(e)
+    if resp.status_code in (200, 201):
+        return True, ""
+    try:
+        body = resp.json()
+        msg = body.get("message", resp.text)
+    except Exception:
+        msg = resp.text or f"HTTP {resp.status_code}"
+    return False, msg
+
+
+def _notion_extract_property_plain(prop: Optional[dict]) -> str:
+    if not prop or not isinstance(prop, dict):
+        return ""
+    ptype = prop.get("type")
+    if ptype == "title":
+        return "".join(p.get("plain_text", "") for p in (prop.get("title") or []))
+    if ptype == "rich_text":
+        return "".join(p.get("plain_text", "") for p in (prop.get("rich_text") or []))
+    if ptype == "date":
+        d = prop.get("date")
+        if not d:
+            return ""
+        start = d.get("start") or ""
+        return start[:10] if start else ""
+    return ""
+
+
+def notion_query_recent_notes(
+    token: str, database_id: str, limit: int = 5
+) -> Tuple[List[Tuple[str, str]], str]:
+    """
+    Query the database sorted by Date descending. Returns (list of (date_str, note_text), error_message).
+    """
+    db_id = _normalize_notion_database_id(database_id)
+    payload = {
+        "page_size": limit,
+        "sorts": [{"property": NOTION_PROP_DATE, "direction": "descending"}],
+    }
+    try:
+        resp = requests.post(
+            f"{NOTION_API_BASE}/databases/{db_id}/query",
+            headers=_notion_headers(token),
+            json=payload,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        return [], str(e)
+    if resp.status_code != 200:
+        try:
+            msg = resp.json().get("message", resp.text)
+        except Exception:
+            msg = resp.text or f"HTTP {resp.status_code}"
+        return [], msg
+    data = resp.json()
+    out: List[Tuple[str, str]] = []
+    for page in data.get("results") or []:
+        props = page.get("properties") or {}
+        date_s = _notion_extract_property_plain(props.get(NOTION_PROP_DATE))
+        note_s = _notion_extract_property_plain(props.get(NOTION_PROP_NOTE))
+        out.append((date_s or "—", note_s or "—"))
+    return out, ""
 
 
 # 2026 meeting dates: (month, day_start, day_end) for Fed; (month, day) for BCCh
@@ -337,37 +571,63 @@ def main():
 
     st.divider()
 
-    # --- Spreads (color coded) ---
+    # --- Spreads (color coded) + 12m sparklines (same order as compute_all_spreads) ---
     st.subheader("Spreads")
+    spark_pairs = [
+        ("US 10Y Treasury Yield", "US 2Y Treasury Yield", fred_results, fred_results),
+        ("Chile BCP/BTP 10Y Yield (CLP)", "US 10Y Treasury Yield", bcch_results, fred_results),
+        ("Chile BCP/BTP 2Y Yield (CLP)", "US 2Y Treasury Yield", bcch_results, fred_results),
+        ("Chile BCP/BTP 10Y Yield (CLP)", "Chile BCP/BTP 2Y Yield (CLP)", bcch_results, bcch_results),
+    ]
     spread_cols = st.columns(4)
     for i, (label, value, date_str) in enumerate(spreads):
         with spread_cols[i]:
             metric_card(label, value, date_str or "N/A", is_spread=True)
+            if i < len(spark_pairs):
+                lk, rk, d_left, d_right = spark_pairs[i]
+                lh = _history(d_left.get(lk))
+                rh = _history(d_right.get(rk))
+                render_spread_sparkline(lh, rh, current_spread=value, chart_key=f"spread-spark-{i}")
 
     st.divider()
 
-    # --- Daily View ---
+    # --- Daily View (Notion database) ---
     st.subheader("Daily View")
-    _dir = os.path.dirname(os.path.abspath(__file__))
-    daily_notes_path = os.path.join(_dir, "daily_notes.txt")
+    notion_token, notion_db_id = get_notion_credentials()
+
+    if st.session_state.pop("notion_saved_ok", None):
+        st.success("Saved to Notion.")
+
     note = st.text_input("Note", key="daily_note", placeholder="Add a note...", label_visibility="collapsed")
     if st.button("Save"):
-        if note and note.strip():
-            today = date.today().isoformat()
-            with open(daily_notes_path, "a", encoding="utf-8") as f:
-                f.write(f"{today} | {note.strip()}\n")
-            st.rerun()
-    if os.path.exists(daily_notes_path):
-        with open(daily_notes_path, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-        last_5 = lines[-5:] if len(lines) >= 5 else lines
-        last_5.reverse()
-        for ln in last_5:
-            if " | " in ln:
-                d, text = ln.split(" | ", 1)
-                st.markdown(f"<span style='font-size: 0.8rem; color: #888;'>{d}</span> {text}", unsafe_allow_html=True)
+        if not notion_token or not notion_db_id:
+            st.error("Set **NOTION_TOKEN** and **NOTION_DATABASE_ID** in your `.env` file.")
+        elif not note or not note.strip():
+            st.warning("Enter a note before saving.")
+        else:
+            ok, err = notion_create_daily_page(notion_token, notion_db_id, note.strip(), date.today())
+            if ok:
+                st.session_state["notion_saved_ok"] = True
+                st.rerun()
             else:
-                st.caption(ln)
+                st.error(f"Notion API error: {err}")
+
+    st.markdown("**Recent notes**")
+    if not notion_token or not notion_db_id:
+        st.caption("Configure `NOTION_TOKEN` and `NOTION_DATABASE_ID` in `.env`, and share the database with your integration.")
+    else:
+        recent, qerr = notion_query_recent_notes(notion_token, notion_db_id, limit=5)
+        if qerr:
+            st.warning(f"Could not load notes: {qerr}")
+        elif not recent:
+            st.caption("No rows yet — save a note above.")
+        else:
+            for d_s, text in recent:
+                esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                st.markdown(
+                    f"<span style='font-size: 0.8rem; color: #888;'>{d_s}</span> {esc}",
+                    unsafe_allow_html=True,
+                )
 
 
 if __name__ == "__main__":
