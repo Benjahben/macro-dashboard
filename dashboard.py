@@ -77,7 +77,7 @@ def render_spread_sparkline(
     current_spread: Optional[float] = None,
     chart_key: str = "spark",
 ):
-    """Compact ~12m spread history: line color matches spread sign; dotted 12m average + label."""
+    """Compact ~12m spread history: line color matches spread sign; dotted 12m average + caption below."""
     try:
         import plotly.graph_objects as go
     except ImportError:
@@ -116,17 +116,6 @@ def render_spread_sparkline(
         )
     )
     fig.add_hline(y=avg_v, line_dash="dot", line_color="rgba(0,0,0,0.45)", line_width=1)
-    fig.add_annotation(
-        xref="paper",
-        x=1.0,
-        y=avg_v,
-        yref="y",
-        xanchor="left",
-        yanchor="middle",
-        text=f" 12m avg {avg_v:+.2f}%",
-        showarrow=False,
-        font=dict(size=10, color="#444444"),
-    )
     fig.update_layout(
         height=145,
         margin=dict(l=0, r=8, t=4, b=28),
@@ -144,6 +133,9 @@ def render_spread_sparkline(
         paper_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=chart_key)
+    # Caption (not Plotly annotation): Plotly treats "%" in annotation text as printf-style,
+    # which breaks labels like "+0.45%". Streamlit caption shows the value reliably.
+    st.caption(f"12m avg: {avg_v:+.2f}%")
 
 
 # ---------------------------------------------------------------------------
